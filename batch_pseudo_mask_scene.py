@@ -14,7 +14,17 @@ from GroundingDINO.groundingdino.util.slconfig import SLConfig
 from GroundingDINO.groundingdino.util.utils import clean_state_dict
 
 # segment anything
-from segment_anything import build_sam, build_sam_hq, SamPredictor
+from segment_anything import (
+    SamAutomaticMaskGenerator,
+    SamPredictor,
+    build_sam,
+    build_sam_hq,
+)
+
+# Recognize Anything Model
+from ram import inference_ram
+from ram.models import ram
+import torchvision.transforms as TS
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}
@@ -84,7 +94,6 @@ def load_scene_labels(json_paths):
         for obj in payload.get("object", []):
             category = obj.get("category", "").strip()
             segmentation = obj.get("segmentation", "").strip()
-            sentences = obj.get("sentence", [])
             if not category or not segmentation:
                 continue
             filename = Path(segmentation).name
@@ -143,10 +152,80 @@ def load_frame_objects(json_path):
     objects = {}
     for obj in payload.get("object", []):
         category = obj.get("category", "").strip()
+        sentence = obj.get("sentence", [])
         if not category:
             continue
-        objects[category] = True
+        objects[category] = {
+            "sentence": sentence[0] if sentence else "",
+        }
     return objects
+
+
+def build_prompt(category, sentence):
+    prompts = [category]
+    if sentence:
+        prompts.append(sentence)
+        prompts.append(f"{category}, {sentence}")
+    unique = []
+    for prompt in prompts:
+        normalized = prompt.strip()
+        if normalized and normalized not in unique:
+            unique.append(normalized)
+    return ". ".join(unique)
+
+
+def build_ram_model(checkpoint_path, device):
+    normalize = TS.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    transform = TS.Compose([TS.Resize((384, 384)), TS.ToTensor(), normalize])
+
+    ram_model = ram(pretrained=checkpoint_path, image_size=384, vit="swin_l")
+    ram_model.eval()
+    ram_model = ram_model.to(device)
+    return ram_model, transform
+
+
+def score_ram_tags(tag_string, category):
+    tags = [tag.strip().lower() for tag in tag_string.replace(" |", ",").split(",")]
+    tags = [tag for tag in tags if tag]
+    return category.lower() in tags
+
+
+def crop_from_mask(image_np, mask):
+    ys, xs = np.where(mask)
+    if ys.size == 0 or xs.size == 0:
+        return None
+    y_min, y_max = ys.min(), ys.max()
+    x_min, x_max = xs.min(), xs.max()
+    return image_np[y_min : y_max + 1, x_min : x_max + 1]
+
+
+def select_mask_with_ram(ram_model, transform, image_np, candidate_masks, category, device):
+    best_mask = None
+    best_area = 0
+    for candidate in candidate_masks:
+        mask = candidate["segmentation"]
+        crop = crop_from_mask(image_np, mask)
+        if crop is None:
+            continue
+        crop_pil = Image.fromarray(crop).convert("RGB")
+        crop_tensor = transform(crop_pil).unsqueeze(0).to(device)
+        res = inference_ram(crop_tensor, ram_model)
+        if score_ram_tags(res[0], category):
+            area = mask.sum()
+            if area > best_area:
+                best_area = area
+                best_mask = mask
+    return best_mask
+
+
+def build_sam_generator(sam_model, args):
+    return SamAutomaticMaskGenerator(
+        sam_model,
+        points_per_side=args.sam_amg_points_per_side,
+        pred_iou_thresh=args.sam_amg_pred_iou_thresh,
+        stability_score_thresh=args.sam_amg_stability_score_thresh,
+        min_mask_region_area=args.sam_amg_min_mask_region_area,
+    )
 
 
 if __name__ == "__main__":
@@ -169,6 +248,11 @@ if __name__ == "__main__":
     parser.add_argument("--sam_checkpoint", type=str, default="sam_vit_h_4b8939.pth")
     parser.add_argument("--sam_hq_checkpoint", type=str, default=None)
     parser.add_argument("--use_sam_hq", action="store_true")
+    parser.add_argument("--ram_checkpoint", type=str, default="ram_swin_large_14m.pth")
+    parser.add_argument("--sam_amg_points_per_side", type=int, default=32)
+    parser.add_argument("--sam_amg_pred_iou_thresh", type=float, default=0.86)
+    parser.add_argument("--sam_amg_stability_score_thresh", type=float, default=0.92)
+    parser.add_argument("--sam_amg_min_mask_region_area", type=int, default=100)
     args = parser.parse_args()
 
     all_frames = list_frames(args.scene_dir)
@@ -192,19 +276,25 @@ if __name__ == "__main__":
 
     model = load_grounding_dino(args.config, args.grounded_checkpoint, device=args.device)
     if args.use_sam_hq:
-        predictor = SamPredictor(build_sam_hq(checkpoint=args.sam_hq_checkpoint).to(args.device))
+        sam_model = build_sam_hq(checkpoint=args.sam_hq_checkpoint).to(args.device)
     else:
-        predictor = SamPredictor(build_sam(checkpoint=args.sam_checkpoint).to(args.device))
+        sam_model = build_sam(checkpoint=args.sam_checkpoint).to(args.device)
+
+    predictor = SamPredictor(sam_model)
+    mask_generator = build_sam_generator(sam_model, args)
+
+    ram_model, ram_transform = build_ram_model(args.ram_checkpoint, args.device)
 
     for frame_path in frame_paths:
         image_pil, image = load_image(frame_path)
+        image_np = np.array(image_pil)
         height, width = image_pil.size[1], image_pil.size[0]
         frame_dir = build_frame_output_dir(args.output_dir, frame_path)
 
         frame_objects = load_frame_objects(json_by_stem[frame_path.stem])
 
-        image_cv = np.array(image_pil)
-        predictor.set_image(image_cv)
+        predictor.set_image(image_np)
+        candidate_masks = mask_generator.generate(image_np)
 
         debug_lines = []
         for label in scene_labels:
@@ -216,40 +306,60 @@ if __name__ == "__main__":
                 save_binary_mask(torch.zeros((1, height, width), dtype=torch.bool), output_path)
                 continue
 
+            sentence = frame_objects[category]["sentence"].strip()
+            prompt = build_prompt(category, sentence)
+
             boxes_filt, scores = get_grounding_output(
                 model,
                 image,
-                category,
+                prompt,
                 args.box_threshold,
                 args.text_threshold,
                 device=args.device,
             )
 
-            if boxes_filt.numel() == 0:
-                save_binary_mask(torch.zeros((1, height, width), dtype=torch.bool), output_path)
-                continue
+            if boxes_filt.numel() > 0:
+                for i in range(boxes_filt.size(0)):
+                    boxes_filt[i] = boxes_filt[i] * torch.Tensor([width, height, width, height])
+                    boxes_filt[i][:2] -= boxes_filt[i][2:] / 2
+                    boxes_filt[i][2:] += boxes_filt[i][:2]
 
-            for i in range(boxes_filt.size(0)):
-                boxes_filt[i] = boxes_filt[i] * torch.Tensor([width, height, width, height])
-                boxes_filt[i][:2] -= boxes_filt[i][2:] / 2
-                boxes_filt[i][2:] += boxes_filt[i][:2]
+                boxes_filt = boxes_filt.cpu()
+                transformed_boxes = predictor.transform.apply_boxes_torch(
+                    boxes_filt, image_np.shape[:2]
+                ).to(args.device)
 
-            boxes_filt = boxes_filt.cpu()
-            transformed_boxes = predictor.transform.apply_boxes_torch(boxes_filt, image_cv.shape[:2]).to(args.device)
+                masks, _, _ = predictor.predict_torch(
+                    point_coords=None,
+                    point_labels=None,
+                    boxes=transformed_boxes.to(args.device),
+                    multimask_output=False,
+                )
 
-            masks, _, _ = predictor.predict_torch(
-                point_coords=None,
-                point_labels=None,
-                boxes=transformed_boxes.to(args.device),
-                multimask_output=False,
+                merged_dino = torch.zeros_like(masks[0]).bool()
+                for mask in masks:
+                    merged_dino = torch.logical_or(merged_dino, mask.bool())
+            else:
+                merged_dino = torch.zeros((1, height, width), dtype=torch.bool)
+
+            ram_mask = select_mask_with_ram(
+                ram_model,
+                ram_transform,
+                image_np,
+                candidate_masks,
+                category,
+                args.device,
             )
-
-            merged = torch.zeros_like(masks[0]).bool()
-            for mask in masks:
-                merged = torch.logical_or(merged, mask.bool())
+            if ram_mask is not None:
+                ram_tensor = torch.from_numpy(ram_mask).unsqueeze(0).bool()
+                merged = torch.logical_or(merged_dino, ram_tensor)
+            else:
+                merged = merged_dino
 
             save_binary_mask(merged.float(), output_path)
-            debug_lines.append(f"{category} ({scores.max().item():.3f})")
+
+            score_text = f"{scores.max().item():.3f}" if boxes_filt.numel() > 0 else "n/a"
+            debug_lines.append(f"{category} ({score_text})")
 
         if args.save_debug:
             debug_path = frame_dir / "debug.txt"
