@@ -351,7 +351,7 @@ if __name__ == "__main__":
                 args.device,
             )
             if ram_mask is not None:
-                ram_tensor = torch.from_numpy(ram_mask).unsqueeze(0).bool()
+                ram_tensor = torch.from_numpy(ram_mask).unsqueeze(0).bool().to(merged_dino.device)
                 merged = torch.logical_or(merged_dino, ram_tensor)
             else:
                 merged = merged_dino
