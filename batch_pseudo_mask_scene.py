@@ -97,7 +97,6 @@ def load_scene_labels(json_paths):
                 labels[category] = {
                     "category": category,
                     "filename": filename,
-                    "sentence": sentences[0] if sentences else "",
                 }
     return list(labels.values())
 
@@ -144,12 +143,9 @@ def load_frame_objects(json_path):
     objects = {}
     for obj in payload.get("object", []):
         category = obj.get("category", "").strip()
-        sentences = obj.get("sentence", [])
         if not category:
             continue
-        objects[category] = {
-            "sentence": sentences[0] if sentences else "",
-        }
+        objects[category] = True
     return objects
 
 
@@ -220,15 +216,10 @@ if __name__ == "__main__":
                 save_binary_mask(torch.zeros((1, height, width), dtype=torch.bool), output_path)
                 continue
 
-            sentence = frame_objects[category]["sentence"].strip()
-            if not sentence:
-                save_binary_mask(torch.zeros((1, height, width), dtype=torch.bool), output_path)
-                continue
-
             boxes_filt, scores = get_grounding_output(
                 model,
                 image,
-                sentence,
+                category,
                 args.box_threshold,
                 args.text_threshold,
                 device=args.device,
@@ -258,7 +249,7 @@ if __name__ == "__main__":
                 merged = torch.logical_or(merged, mask.bool())
 
             save_binary_mask(merged.float(), output_path)
-            debug_lines.append(f"{category}: {sentence} ({scores.max().item():.3f})")
+            debug_lines.append(f"{category} ({scores.max().item():.3f})")
 
         if args.save_debug:
             debug_path = frame_dir / "debug.txt"
