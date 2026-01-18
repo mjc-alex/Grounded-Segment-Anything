@@ -550,24 +550,21 @@ python automatic_label_tag2text_demo.py \
 
 ### :film_strip: Batch pseudo-mask generation for scene frames
 Generate per-frame binary masks for a scene folder (e.g., video frames) using a two-stage pipeline:
-1. Build a scene-level label vocabulary with RAM or Tag2Text across frames.
+1. Build a scene-level label vocabulary from per-frame JSON annotations.
 2. Run Grounded-SAM per frame with the fixed label set; missing labels produce all-zero masks.
 
+Inputs are a frame directory plus a matching JSON directory (e.g., `frame_00007.jpg` with `frame_00007.json`).
 Outputs are written per frame to:
 ```
 output_root/<frame_stem>/<object>.png
 ```
 
-Example (RAM labels, every 5th frame for vocab, keep top 10 tags, limit to 30 labels):
+Example:
 ```bash
 python batch_pseudo_mask_scene.py \
   --scene_dir /path/to/scene_frames \
+  --json_dir /path/to/scene_jsons \
   --output_dir /path/to/output_root \
-  --label_source ram \
-  --sample_stride 5 \
-  --topk_tags 10 \
-  --min_freq_ratio 0.3 \
-  --max_labels 30 \
   --box_threshold 0.25 \
   --text_threshold 0.2 \
   --device cuda
@@ -577,8 +574,8 @@ Validate paths only (no model weights needed):
 ```bash
 python batch_pseudo_mask_scene.py \
   --scene_dir /path/to/scene_frames \
+  --json_dir /path/to/scene_jsons \
   --output_dir /path/to/output_root \
-  --label_source ram \
   --validate_paths
 ```
 
